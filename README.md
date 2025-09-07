@@ -1,0 +1,3 @@
+# TrustGrove
+
+TrustGrove is a zero-knowledge academic credential verification system that creates a decentralized forest of trust trees where institutions form root nodes and credentials branch out as cryptographically linked leaves using zk-SNARKs for privacy preservation. The system enables selective disclosure of credential attributes through privacy gates while maintaining complete anonymity, allowing verification of qualifications without revealing exact values or issuing institutions.
