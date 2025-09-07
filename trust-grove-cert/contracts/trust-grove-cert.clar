@@ -16,6 +16,7 @@
 (define-constant ERR-BATCH-SIZE-EXCEEDED (err u111))
 (define-constant ERR-TEMPORAL-UPDATE-FAILED (err u112))
 (define-constant ERR-CROSS-VERIFICATION-FAILED (err u113))
+(define-constant ERR-INSTITUTION-ALREADY-EXISTS (err u114))
 
 ;; Contract owner
 (define-data-var contract-owner principal tx-sender)
@@ -25,6 +26,9 @@
 (define-data-var max-batch-size uint u50)
 (define-data-var reputation-threshold uint u75) ;; 75/100 minimum
 (define-data-var grove-protocol-version uint u1)
+
+;; Request ID counter
+(define-data-var next-request-id uint u1)
 
 ;; Institution registry and trust forest
 (define-map institutions 
@@ -42,7 +46,7 @@
     })
 
 ;; Credential DNA mapping - unique cryptographic fingerprints
-(define-map credential-dna 
+(define-map credentials 
     (buff 32) ;; DNA hash
     {
         institution: principal,
@@ -55,7 +59,7 @@
     })
 
 ;; Student credential ownership
-(define-map student-credentials
+(define-map student-profiles
     principal ;; Student
     {
         credential-count: uint,
@@ -69,7 +73,7 @@
     uint ;; Request ID
     {
         verifier: principal,
-        credential-dnas: (list 20 (buff 32)),
+        dna-hashes: (list 20 (buff 32)),
         proof-requirements: uint,
         status: (string-ascii 16),
         batch-merkle-root: (buff 32),
@@ -116,9 +120,6 @@
         evolution-chain: (list 10 (buff 32)),
         last-update: uint
     })
-
-;; Request ID counter
-(define-data-var next-request-id uint u1)
 
 ;; Admin Functions
 
@@ -181,7 +182,7 @@
 
 ;; Credential DNA Functions
 
-(define-public (mint-credential-dna 
+(define-public (mint-credential 
     (student principal)
     (dna-hash (buff 32))
     (degree-proof (buff 64))
@@ -192,11 +193,11 @@
         inst-data
         (begin
             (asserts! (get is-active inst-data) ERR-UNAUTHORIZED)
-            (asserts! (is-none (map-get? credential-dna dna-hash)) ERR-CREDENTIAL-ALREADY-EXISTS)
+            (asserts! (is-none (map-get? credentials dna-hash)) ERR-CREDENTIAL-ALREADY-EXISTS)
             (asserts! (not (is-eq dna-hash 0x)) ERR-INVALID-DNA)
             
-            ;; Create credential DNA record
-            (map-set credential-dna dna-hash {
+            ;; Create credential record
+            (map-set credentials dna-hash {
                 institution: tx-sender,
                 degree-level-proof: degree-proof,
                 field-study-proof: field-proof,
@@ -206,11 +207,11 @@
                 privacy-gates: privacy-gates-config
             })
             
-            ;; Update student credentials
+            ;; Update student profile
             (let ((current-student-data (default-to 
                     {credential-count: u0, total-verifications: u0, privacy-settings: u0, reputation-boost: u0}
-                    (map-get? student-credentials student))))
-                (map-set student-credentials student 
+                    (map-get? student-profiles student))))
+                (map-set student-profiles student 
                          (merge current-student-data 
                                {credential-count: (+ (get credential-count current-student-data) u1)})))
             
@@ -221,7 +222,7 @@
     (original-dna (buff 32))
     (new-dna (buff 32))
     (evolution-proof (buff 128)))
-    (match (map-get? credential-dna original-dna)
+    (match (map-get? credentials original-dna)
         cred-data
         (begin
             (asserts! (is-eq (get institution cred-data) tx-sender) ERR-UNAUTHORIZED)
@@ -243,11 +244,11 @@
 ;; Verification Functions
 
 (define-public (batch-verify-credentials 
-    (credential-dnas (list 20 (buff 32)))
+    (dna-list (list 20 (buff 32)))
     (batch-proof (buff 512))
     (required-attributes uint))
     (let ((request-id (var-get next-request-id))
-          (batch-size (len credential-dnas)))
+          (batch-size (len dna-list)))
         (begin
             (asserts! (<= batch-size (var-get max-batch-size)) ERR-BATCH-SIZE-EXCEEDED)
             (var-set next-request-id (+ request-id u1))
@@ -255,15 +256,15 @@
             ;; Create verification request
             (map-set verification-requests request-id {
                 verifier: tx-sender,
-                credential-dnas: credential-dnas,
+                dna-hashes: dna-list,
                 proof-requirements: required-attributes,
                 status: "processing",
                 batch-merkle-root: 0x,
                 timestamp: block-height
             })
             
-            ;; Process batch verification (simplified)
-            (let ((verification-result (fold verify-single-credential credential-dnas true)))
+            ;; Process batch verification
+            (let ((verification-result (fold verify-single-credential dna-list true)))
                 (if verification-result
                     (begin
                         (map-set verification-requests request-id 
@@ -274,3 +275,162 @@
 
 (define-private (verify-single-credential (dna (buff 32)) (prev-result bool))
     (if (not prev-result)
+        false
+        (match (map-get? credentials dna)
+            cred-data
+            (begin
+                ;; Update verification count
+                (map-set credentials dna 
+                         (merge cred-data {verification-count: (+ (get verification-count cred-data) u1)}))
+                true)
+            false)))
+
+;; Privacy and Selective Disclosure Functions
+
+(define-public (create-privacy-gate 
+    (gate-id uint)
+    (allowed-verifiers (list 10 principal))
+    (disclosure-level uint)
+    (expiry-height uint))
+    (begin
+        (map-set privacy-gates {student: tx-sender, gate-id: gate-id} {
+            allowed-verifiers: allowed-verifiers,
+            disclosure-level: disclosure-level,
+            expiry-height: expiry-height,
+            usage-count: u0
+        })
+        (ok gate-id)))
+
+(define-public (verify-with-privacy-gate 
+    (student principal)
+    (gate-id uint)
+    (dna-hash (buff 32))
+    (selective-proof (buff 256)))
+    (match (map-get? privacy-gates {student: student, gate-id: gate-id})
+        gate-data
+        (begin
+            (asserts! (< block-height (get expiry-height gate-data)) ERR-PRIVACY-GATE-LOCKED)
+            (asserts! (is-some (index-of (get allowed-verifiers gate-data) tx-sender)) ERR-UNAUTHORIZED)
+            
+            ;; Update usage count
+            (map-set privacy-gates {student: student, gate-id: gate-id}
+                     (merge gate-data {usage-count: (+ (get usage-count gate-data) u1)}))
+            
+            ;; Verify credential with selective disclosure
+            (match (map-get? credentials dna-hash)
+                cred-data (ok true)
+                ERR-INVALID-CREDENTIAL))
+        ERR-PRIVACY-GATE-LOCKED))
+
+;; Cross-institutional verification functions
+
+(define-public (initiate-cross-verification 
+    (partner-institution principal)
+    (dna-batch (list 10 (buff 32)))
+    (verification-proof (buff 512)))
+    (match (map-get? institutions tx-sender)
+        inst-data
+        (begin
+            (asserts! (get is-active inst-data) ERR-UNAUTHORIZED)
+            (match (map-get? institutions partner-institution)
+                partner-data
+                (begin
+                    (asserts! (get is-active partner-data) ERR-CROSS-VERIFICATION-FAILED)
+                    
+                    ;; Update cross-verification patterns
+                    (let ((pattern-key {institution-a: tx-sender, institution-b: partner-institution}))
+                        (let ((current-pattern (default-to 
+                                {verification-count: u0, success-rate: u100, trust-coefficient: u50, last-verification: u0}
+                                (map-get? cross-verification-patterns pattern-key))))
+                            (map-set cross-verification-patterns pattern-key
+                                     (merge current-pattern 
+                                           {verification-count: (+ (get verification-count current-pattern) u1),
+                                            last-verification: block-height}))))
+                    (ok true))
+                ERR-INSTITUTION-NOT-FOUND))
+        ERR-INSTITUTION-NOT-FOUND))
+
+;; Reputation management functions
+
+(define-public (update-reputation-metrics 
+    (weekly-verifs uint)
+    (fraud-reports uint)
+    (peer-endorsements uint))
+    (match (map-get? institutions tx-sender)
+        inst-data
+        (begin
+            (asserts! (get is-active inst-data) ERR-UNAUTHORIZED)
+            
+            (map-set reputation-metrics tx-sender {
+                weekly-verifications: weekly-verifs,
+                fraud-reports: fraud-reports,
+                peer-endorsements: peer-endorsements,
+                temporal-consistency: u100, ;; Calculated value
+                cross-ref-score: u100 ;; Calculated value
+            })
+            
+            ;; Update institution reputation score
+            (let ((new-reputation (calculate-reputation-score weekly-verifs fraud-reports peer-endorsements)))
+                (map-set institutions tx-sender 
+                         (merge inst-data {reputation-score: new-reputation})))
+            
+            (ok true))
+        ERR-INSTITUTION-NOT-FOUND))
+
+(define-private (calculate-reputation-score (verifs uint) (fraud uint) (endorsements uint))
+    ;; Simplified reputation calculation
+    (let ((base-score u100)
+          (fraud-penalty (* fraud u10))
+          (endorsement-bonus (* endorsements u5))
+          (verification-bonus (/ verifs u10)))
+        (if (>= base-score fraud-penalty)
+            (+ (- base-score fraud-penalty) endorsement-bonus verification-bonus)
+            u0)))
+
+;; Query Functions
+
+(define-read-only (get-institution-info (institution principal))
+    (map-get? institutions institution))
+
+(define-read-only (get-credential-info (dna (buff 32)))
+    (map-get? credentials dna))
+
+(define-read-only (get-student-profile (student principal))
+    (map-get? student-profiles student))
+
+(define-read-only (get-verification-request (request-id uint))
+    (map-get? verification-requests request-id))
+
+(define-read-only (get-reputation-metrics (institution principal))
+    (map-get? reputation-metrics institution))
+
+(define-read-only (get-cross-verification-pattern (inst-a principal) (inst-b principal))
+    (map-get? cross-verification-patterns {institution-a: inst-a, institution-b: inst-b}))
+
+(define-read-only (get-system-config)
+    {
+        minimum-stake: (var-get minimum-stake-amount),
+        max-batch-size: (var-get max-batch-size),
+        reputation-threshold: (var-get reputation-threshold),
+        protocol-version: (var-get grove-protocol-version),
+        contract-owner: (var-get contract-owner)
+    })
+
+(define-read-only (is-institution-active (institution principal))
+    (match (map-get? institutions institution)
+        inst-data (get is-active inst-data)
+        false))
+
+(define-read-only (get-credential-evolution (original-dna (buff 32)))
+    (map-get? credential-evolution original-dna))
+
+(define-read-only (get-privacy-gate (student principal) (gate-id uint))
+    (map-get? privacy-gates {student: student, gate-id: gate-id}))
+
+;; Utility functions for batch operations
+
+(define-private (validate-dna-list (dna-list (list 20 (buff 32))))
+    (fold check-valid-dna dna-list true))
+
+(define-private (check-valid-dna (dna (buff 32)) (prev-valid bool))
+    (and prev-valid (not (is-eq dna 0x))))
